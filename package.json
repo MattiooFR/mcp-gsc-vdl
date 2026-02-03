@@ -1,0 +1,37 @@
+{
+  "name": "mcp-gsc-vdl",
+  "version": "1.0.0",
+  "description": "Multi-account Google Search Console MCP Server with Supabase VDL integration",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-gsc-vdl": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": [
+    "mcp",
+    "google-search-console",
+    "seo",
+    "supabase",
+    "multi-account"
+  ],
+  "author": "VDL",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@supabase/supabase-js": "^2.39.0",
+    "google-auth-library": "^9.15.0",
+    "googleapis": "^146.0.0",
+    "zod": "^3.25.0",
+    "zod-to-json-schema": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.0"
+  }
+}
