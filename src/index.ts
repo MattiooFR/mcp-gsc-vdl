@@ -1,14 +1,24 @@
 #!/usr/bin/env node
 
 /**
- * MCP GSC VDL - Multi-Account Google Search Console MCP Server
+ * MCP GSC Multi-Account
+ * 
+ * A Model Context Protocol server for Google Search Console
+ * with multi-account support.
  * 
  * Features:
- * - Multi-account support via Supabase VDL
- * - Search Analytics with Quick Wins detection
+ * - Multi-account management (switch between accounts dynamically)
+ * - Search Analytics with up to 25,000 rows
+ * - Quick Wins detection (SEO opportunities)
  * - URL Indexing submission
  * - Period comparison
  * - Sitemap management
+ * 
+ * Account configuration:
+ * - GSC_ACCOUNTS_JSON: JSON string with accounts config
+ * - GSC_ACCOUNTS_FILE: Path to JSON file with accounts config
+ * - GSC_REFRESH_TOKEN + GSC_EMAIL: Single account via env vars
+ * - register_account tool: Add accounts at runtime
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -22,7 +32,7 @@ import {
 import { zodToJsonSchema } from 'zod-to-json-schema';
 import { z } from 'zod';
 
-import { SupabaseAuthProvider, GSCAccount } from './supabase-auth.js';
+import { AccountManager } from './accounts.js';
 import { SearchConsoleService } from './search-console.js';
 import {
   SearchAnalyticsSchema,
@@ -34,35 +44,13 @@ import {
   ComparePeriodsSchema,
 } from './schemas.js';
 
-// Environment configuration
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://ovptccunortgzaxxgexo.supabase.co';
-const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || '';
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
-
-// Validate required environment variables
-if (!SUPABASE_KEY) {
-  console.error('SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY is required');
-  process.exit(1);
-}
-
-if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
-  console.error('GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required');
-  process.exit(1);
-}
-
-// Initialize providers
-const authProvider = new SupabaseAuthProvider(
-  SUPABASE_URL,
-  SUPABASE_KEY,
-  GOOGLE_CLIENT_ID,
-  GOOGLE_CLIENT_SECRET
-);
+// Initialize account manager from environment
+const accountManager = AccountManager.fromEnvironment();
 
 // Create MCP Server
 const server = new Server(
   {
-    name: 'mcp-gsc-vdl',
+    name: 'mcp-gsc-multi-account',
     version: '1.0.0',
   },
   {
@@ -73,42 +61,39 @@ const server = new Server(
 );
 
 // Helper to get service for an account
-async function getServiceForAccount(email?: string): Promise<{ service: SearchConsoleService; account: GSCAccount }> {
-  let account: GSCAccount | null;
-  
-  if (email) {
-    account = await authProvider.getAccount(email);
-    if (!account) {
-      throw new McpError(ErrorCode.InvalidParams, `Account not found: ${email}`);
-    }
-  } else {
-    const accounts = await authProvider.listAccounts();
-    if (accounts.length === 0) {
-      throw new McpError(ErrorCode.InternalError, 'No GSC accounts available');
-    }
-    account = accounts[0];
-  }
-
-  const authClient = await authProvider.getAuthClient(account.email);
-  const service = new SearchConsoleService(authClient);
-  
-  return { service, account };
+async function getService(accountIdOrEmail?: string): Promise<{ service: SearchConsoleService; email: string }> {
+  const { client, account } = await accountManager.getAuthClient(accountIdOrEmail);
+  const service = new SearchConsoleService(client);
+  return { service, email: account.email };
 }
+
+// Register Account Schema
+const RegisterAccountSchema = z.object({
+  id: z.string().describe('Unique identifier for this account'),
+  email: z.string().email().describe('Google account email'),
+  refreshToken: z.string().describe('OAuth2 refresh token'),
+  accessToken: z.string().optional().describe('Optional current access token'),
+});
 
 // List Tools Handler
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
+        name: 'register_account',
+        description: 'Register a new Google Search Console account for use. Accounts can also be configured via GSC_ACCOUNTS_JSON or GSC_ACCOUNTS_FILE environment variables.',
+        inputSchema: zodToJsonSchema(RegisterAccountSchema),
+      },
+      {
         name: 'list_accounts',
-        description: 'List all available Google Search Console accounts from VDL',
+        description: 'List all registered Google Search Console accounts',
         inputSchema: zodToJsonSchema(z.object({})),
       },
       {
         name: 'list_sites',
-        description: 'List all sites for a specific GSC account',
+        description: 'List all sites accessible by an account',
         inputSchema: zodToJsonSchema(z.object({
-          account: z.string().optional().describe('Google account email (optional, uses first account if not specified)'),
+          account: z.string().optional().describe('Account ID or email (uses first account if not specified)'),
         })),
       },
       {
@@ -156,19 +141,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
-      case 'list_accounts': {
-        const accounts = await authProvider.listAccounts();
+      case 'register_account': {
+        const params = RegisterAccountSchema.parse(args);
+        accountManager.registerAccount(
+          params.id,
+          params.email,
+          params.refreshToken,
+          params.accessToken
+        );
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              accounts: accounts.map(a => ({
-                email: a.email,
-                sitesCount: a.sitesCount,
-                isValid: a.isValid,
-              })),
+              success: true,
+              message: `Account ${params.id} (${params.email}) registered successfully`,
+              totalAccounts: accountManager.count,
+            }, null, 2),
+          }],
+        };
+      }
+
+      case 'list_accounts': {
+        const accounts = accountManager.listAccounts();
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              accounts,
               totalAccounts: accounts.length,
-              totalSites: accounts.reduce((sum, a) => sum + (a.sitesCount || 0), 0),
             }, null, 2),
           }],
         };
@@ -176,16 +176,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'list_sites': {
         const { account } = args as { account?: string };
-        const { service, account: usedAccount } = await getServiceForAccount(account);
-        const sites = await authProvider.getSitesForAccount(usedAccount.email);
+        const { service, email } = await getService(account);
+        const result = await service.listSites();
         
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              account: usedAccount.email,
-              sites,
-              totalSites: sites.length,
+              account: email,
+              sites: result.data.siteEntry || [],
+              totalSites: result.data.siteEntry?.length || 0,
             }, null, 2),
           }],
         };
@@ -193,7 +193,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'search_analytics': {
         const params = SearchAnalyticsSchema.parse(args);
-        const { service, account } = await getServiceForAccount(params.account);
+        const { service, email } = await getService(params.account);
 
         // Build request
         const requestBody: any = {
@@ -248,7 +248,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              account: account.email,
+              account: email,
               siteUrl: params.siteUrl,
               dateRange: { start: params.startDate, end: params.endDate },
               rowCount: result.data.rows?.length || 0,
@@ -260,7 +260,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'detect_quick_wins': {
         const params = QuickWinsSchema.parse(args);
-        const { service, account } = await getServiceForAccount(params.account);
+        const { service, email } = await getService(params.account);
 
         const quickWins = await service.detectQuickWins(
           params.siteUrl,
@@ -275,7 +275,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         );
 
-        // Calculate totals
         const totalAdditionalClicks = quickWins.reduce((sum, qw) => sum + qw.additionalClicks, 0);
         const highOpportunities = quickWins.filter(qw => qw.opportunity === 'High').length;
 
@@ -283,7 +282,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              account: account.email,
+              account: email,
               siteUrl: params.siteUrl,
               dateRange: { start: params.startDate, end: params.endDate },
               thresholds: {
@@ -304,7 +303,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'compare_periods': {
         const params = ComparePeriodsSchema.parse(args);
-        const { service, account } = await getServiceForAccount(params.account);
+        const { service, email } = await getService(params.account);
 
         const result = await service.comparePeriods(
           params.siteUrl,
@@ -320,7 +319,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              account: account.email,
+              account: email,
               siteUrl: params.siteUrl,
               ...result,
             }, null, 2),
@@ -330,7 +329,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'inspect_url': {
         const params = InspectUrlSchema.parse(args);
-        const { service, account } = await getServiceForAccount(params.account);
+        const { service, email } = await getService(params.account);
 
         const result = await service.inspectUrl(
           params.siteUrl,
@@ -342,7 +341,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              account: account.email,
+              account: email,
               inspectedUrl: params.inspectionUrl,
               result: result.data,
             }, null, 2),
@@ -352,7 +351,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'submit_url_for_indexing': {
         const params = SubmitIndexingSchema.parse(args);
-        const { service, account } = await getServiceForAccount(params.account);
+        const { service, email } = await getService(params.account);
 
         try {
           const result = await service.submitUrlForIndexing(params.url, params.type);
@@ -362,7 +361,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               type: 'text',
               text: JSON.stringify({
                 success: true,
-                account: account.email,
+                account: email,
                 url: params.url,
                 type: params.type,
                 notifyTime: new Date().toISOString(),
@@ -393,7 +392,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'list_sitemaps': {
         const params = ListSitemapsSchema.parse(args);
-        const { service, account } = await getServiceForAccount(params.account);
+        const { service, email } = await getService(params.account);
 
         const result = await service.listSitemaps(params.siteUrl);
 
@@ -401,7 +400,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              account: account.email,
+              account: email,
               siteUrl: params.siteUrl,
               sitemaps: result.data.sitemap || [],
             }, null, 2),
@@ -411,7 +410,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'submit_sitemap': {
         const params = SubmitSitemapSchema.parse(args);
-        const { service, account } = await getServiceForAccount(params.account);
+        const { service, email } = await getService(params.account);
 
         await service.submitSitemap(params.siteUrl, params.feedpath);
 
@@ -420,7 +419,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: 'text',
             text: JSON.stringify({
               success: true,
-              account: account.email,
+              account: email,
               siteUrl: params.siteUrl,
               sitemap: params.feedpath,
               message: 'Sitemap submitted successfully',
@@ -447,7 +446,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('MCP GSC VDL Server running on stdio');
+  console.error('MCP GSC Multi-Account Server running on stdio');
+  console.error(`Accounts loaded: ${accountManager.count}`);
 }
 
 main().catch((error) => {
